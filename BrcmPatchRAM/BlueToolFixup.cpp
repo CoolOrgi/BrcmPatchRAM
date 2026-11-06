@@ -161,7 +161,46 @@ static const uint8_t kBadChipsetCheckPatched15_4[] =
     0x90, 0x90
 };
 
+
+// Realtek (and other non-Broadcom) controllers on macOS 26 Tahoe: after LE Read Remote
+// Features, bluetoothd waits for an LE Data Length Change (or PHY Update Complete) event
+// before it marks the link ready (LE_READY_WAIT_FOR_LENGTH / _PHY). When the controller never
+// sends that event, BLE devices (mice, keyboards) never finish connecting and drop with
+// reason 722 after ~30 s. This turns the "need length/PHY negotiation" branch in the
+// Read Remote Used Features callback into an unconditional jump to LinkReady.
+// Opt-in with -btlfxlinkready. Found on 26.7.2 (25G332), x86_64.
+static const uint8_t kSkipLengthPhyWaitOriginal[] =
+{
+    0x8B, 0x4D, 0xB8,        // mov ecx, [rbp-0x48]   (2M PHY wanted)
+    0x89, 0xC8,              // mov eax, ecx
+    0x8A, 0x55, 0xBF,        // mov dl, [rbp-0x41]    (data length ext. wanted)
+    0x08, 0xD0,              // or al, dl
+    0xA8, 0x01,              // test al, 1
+    0x74, 0x7D,              // je LinkReady
+    0x89, 0xC8,              // mov eax, ecx
+    0x34, 0x01,              // xor al, 1
+    0x20, 0xD0,              // and al, dl
+    0x3C, 0x01,              // cmp al, 1
+    0x75, 0x09               // jne short
+};
+
+static const uint8_t kSkipLengthPhyWaitPatched[] =
+{
+    0x8B, 0x4D, 0xB8,
+    0x89, 0xC8,
+    0x8A, 0x55, 0xBF,
+    0x08, 0xD0,
+    0xA8, 0x01,
+    0xEB, 0x7D,              // jmp LinkReady (always)
+    0x89, 0xC8,
+    0x34, 0x01,
+    0x20, 0xD0,
+    0x3C, 0x01,
+    0x75, 0x09
+};
+
 static bool shouldPatchBoardId = false;
+static bool shouldPatchLinkReady = false;
 static bool shouldPatchAddress = false;
 static bool shouldPatchNvramCheck = false;
 
@@ -236,6 +275,8 @@ static void patched_cs_validate_page(vnode_t vp, memory_object_t pager, memory_o
                 searchAndPatch(data, PAGE_SIZE, path, boardIdsWithUSBBluetooth[0], kBoardIdSize, BaseDeviceInfo::get().boardIdentifier, kBoardIdSize);
             if (shouldPatchAddress)
                 searchAndPatchWithMask(data, PAGE_SIZE, path, kSkipAddressCheckOriginal, kSkipAddressCheckMask, kSkipAddressCheckPatched, kSkipAddressCheckMask);
+            if (shouldPatchLinkReady)
+                searchAndPatch(data, PAGE_SIZE, path, kSkipLengthPhyWaitOriginal, kSkipLengthPhyWaitPatched);
         }
     }
 }
@@ -267,6 +308,9 @@ static void pluginStart() {
             shouldPatchAddress = checkKernelArgument("-btlfxallowanyaddr");
         if (getKernelVersion() <= KernelVersion::Sonoma)
             shouldPatchNvramCheck = checkKernelArgument("-btlfxnvramcheck");
+        shouldPatchLinkReady = checkKernelArgument("-btlfxlinkready");
+        if (shouldPatchLinkReady)
+            SYSLOG(MODULE_SHORT, "linkready patch enabled (-btlfxlinkready)");
         KernelPatcher::RouteRequest csRoute = KernelPatcher::RouteRequest("_cs_validate_page", patched_cs_validate_page, orig_cs_validate);
         if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1))
             SYSLOG(MODULE_SHORT, "failed to route cs validation pages");
